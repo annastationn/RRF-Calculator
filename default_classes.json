@@ -1,0 +1,12 @@
+[
+  {"class": "paraphine", "H_formula": "2*C+2", "summary_group": "paraffins+isoparaffins"},
+  {"class": "naphthene", "H_formula": "2*C", "summary_group": "monocyclic naphthenes"},
+  {"class": "bicycle naphthene", "H_formula": "2*C-2", "summary_group": "bicyclic naphthenes"},
+  {"class": "tricycle naphthene", "H_formula": "2*C-4", "summary_group": "tricyclic naphthenes"},
+  {"class": "aromatic", "H_formula": "2*C-6", "summary_group": "monocyclic aromatics"},
+  {"class": "biphenyl", "H_formula": "2*C-14", "summary_group": "bicyclic aromatics"},
+  {"class": "naphthalene", "H_formula": "2*C-12", "summary_group": "bicyclic aromatics"},
+  {"class": "naphthaAromatic", "H_formula": "2*C-8", "summary_group": "naphthenoaromatic structures"},
+  {"class": "tetralin", "H_formula": "2*C-8", "summary_group": "naphthenoaromatic structures"},
+  {"class": "indane", "H_formula": "2*C-8", "summary_group": "naphthenoaromatic structures"}
+]
