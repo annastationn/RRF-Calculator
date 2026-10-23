@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import csv
-import io
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -11,6 +8,7 @@ from openpyxl import load_workbook
 from PySide6.QtCore import Qt, QStandardPaths
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -31,8 +29,8 @@ import core
 class RRFWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RRF Calculator — prototype")
-        self.resize(980, 680)
+        self.setWindowTitle("RRF Calculator — v2")
+        self.resize(1080, 720)
         self.setAcceptDrops(True)
 
         self.input_path: Path | None = None
@@ -41,7 +39,7 @@ class RRFWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_calculation_tab(), "Calculation")
-        self.tabs.addTab(self._build_dictionary_tab(), "Class dictionary")
+        self.tabs.addTab(self._build_dictionary_tab(), "Chemical dictionary")
         self.setCentralWidget(self.tabs)
 
         self._fill_dictionary_table()
@@ -58,7 +56,8 @@ class RRFWindow(QMainWindow):
 
     def _load_default_dictionary(self) -> list[dict[str, str]]:
         with self._resource_path("default_classes.json").open("r", encoding="utf-8") as f:
-            return json.load(f)
+            rows = json.load(f)
+        return core.validate_dictionary(rows)
 
     def _config_dir(self) -> Path:
         path = Path(QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation))
@@ -66,42 +65,37 @@ class RRFWindow(QMainWindow):
         return path
 
     def _user_dictionary_path(self) -> Path:
+        return self._config_dir() / "chemical_dictionary.json"
+
+    def _legacy_user_dictionary_path(self) -> Path:
         return self._config_dir() / "classes.json"
 
     def _load_user_dictionary(self) -> list[dict[str, str]]:
-        path = self._user_dictionary_path()
-        if not path.exists():
+        new_path = self._user_dictionary_path()
+        legacy_path = self._legacy_user_dictionary_path()
+
+        source = new_path if new_path.exists() else legacy_path if legacy_path.exists() else None
+        if source is None:
             return [dict(row) for row in self.default_dictionary]
+
         try:
-            with path.open("r", encoding="utf-8") as f:
+            with source.open("r", encoding="utf-8") as f:
                 rows = json.load(f)
-            self._validate_dictionary(rows)
+            rows = core.validate_dictionary(rows)
+            # If we loaded the old classes.json, transparently migrate it to v2.
+            if source == legacy_path:
+                with new_path.open("w", encoding="utf-8") as f:
+                    json.dump(rows, f, ensure_ascii=False, indent=2)
             return rows
         except Exception:
             return [dict(row) for row in self.default_dictionary]
 
     def _save_user_dictionary(self) -> None:
         rows = self._dictionary_from_table()
-        self._validate_dictionary(rows)
+        rows = core.validate_dictionary(rows)
         with self._user_dictionary_path().open("w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
         self.dictionary_rows = rows
-
-    def _write_runtime_classes_txt(self) -> Path:
-        """Generate the same semicolon dictionary format expected by the proven core."""
-        rows = self._dictionary_from_table()
-        self._validate_dictionary(rows)
-        path = self._config_dir() / "classes_runtime.txt"
-        with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["class", "H_formula", "summary_group"],
-                delimiter=";",
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-        self.dictionary_rows = rows
-        return path
 
     # -------------------- interface --------------------
 
@@ -114,8 +108,9 @@ class RRFWindow(QMainWindow):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Load a chromatographic XLSX file. The app validates Group Name/Volume, "
-            "calculates C, H, Formula, RRF, RRF*V and w, %, then creates the Class summary heatmap."
+            "Load a chromatographic XLSX file. The app resolves molecular formulas from the "
+            "Chemical dictionary, calculates C, H, Molecular Weight, RRF, RRF*V and w, %, "
+            "then creates the Class summary heatmap."
         )
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
@@ -153,19 +148,23 @@ class RRFWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         info = QLabel(
-            "Static class dictionary. Edit it when a new chemical class appears. "
-            "summary_group remains in English and determines the columns of Class summary."
+            "Each row is either a class or an exact compound. "
+            "Class example: aromatic | class | C[n]H[2*n-6]. "
+            "Exact compound example: benzoic acid | compound | C7H6O2. "
+            "Molecular weight is calculated automatically from the resolved formula."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.dict_table = QTableWidget(0, 3)
-        self.dict_table.setHorizontalHeaderLabels(["class", "H_formula", "summary_group"])
+        self.dict_table = QTableWidget(0, 4)
+        self.dict_table.setHorizontalHeaderLabels(
+            ["name", "type", "formula_rule", "summary_group"]
+        )
         self.dict_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.dict_table, 1)
 
         controls = QHBoxLayout()
-        add_btn = QPushButton("+ Add class")
+        add_btn = QPushButton("+ Add entry")
         add_btn.clicked.connect(self._add_dictionary_row)
         delete_btn = QPushButton("Delete selected")
         delete_btn.clicked.connect(self._delete_dictionary_rows)
@@ -194,55 +193,49 @@ class RRFWindow(QMainWindow):
 
     # -------------------- dictionary --------------------
 
+    def _make_type_combo(self, value: str = "class") -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(["class", "compound"])
+        index = combo.findText(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        return combo
+
     def _fill_dictionary_table(self) -> None:
         self.dict_table.setRowCount(0)
         for row in self.dictionary_rows:
             r = self.dict_table.rowCount()
             self.dict_table.insertRow(r)
-            self.dict_table.setItem(r, 0, QTableWidgetItem(str(row["class"])))
-            self.dict_table.setItem(r, 1, QTableWidgetItem(str(row["H_formula"])))
-            self.dict_table.setItem(r, 2, QTableWidgetItem(str(row["summary_group"])))
+            self.dict_table.setItem(r, 0, QTableWidgetItem(str(row["name"])))
+            self.dict_table.setCellWidget(r, 1, self._make_type_combo(str(row["type"])))
+            self.dict_table.setItem(r, 2, QTableWidgetItem(str(row["formula_rule"])))
+            self.dict_table.setItem(r, 3, QTableWidgetItem(str(row["summary_group"])))
         self.dict_table.resizeColumnsToContents()
 
     def _dictionary_from_table(self) -> list[dict[str, str]]:
         rows = []
         for r in range(self.dict_table.rowCount()):
-            values = []
-            for c in range(3):
-                item = self.dict_table.item(r, c)
-                values.append("" if item is None else item.text().strip())
+            name_item = self.dict_table.item(r, 0)
+            formula_item = self.dict_table.item(r, 2)
+            group_item = self.dict_table.item(r, 3)
+            type_widget = self.dict_table.cellWidget(r, 1)
+            entry_type = type_widget.currentText().strip() if isinstance(type_widget, QComboBox) else ""
             rows.append(
                 {
-                    "class": values[0],
-                    "H_formula": values[1],
-                    "summary_group": values[2],
+                    "name": "" if name_item is None else name_item.text().strip(),
+                    "type": entry_type,
+                    "formula_rule": "" if formula_item is None else formula_item.text().strip(),
+                    "summary_group": "" if group_item is None else group_item.text().strip(),
                 }
             )
         return rows
 
-    def _validate_dictionary(self, rows: list[dict[str, str]]) -> None:
-        seen = set()
-        for i, row in enumerate(rows, start=1):
-            class_name = core.normalize_text(row.get("class", ""))
-            h_formula = core.normalize_text(row.get("H_formula", ""))
-            summary_group = core.normalize_text(row.get("summary_group", ""))
-            if not class_name or not h_formula or not summary_group:
-                raise ValueError(
-                    f"Dictionary row {i}: class, H_formula and summary_group must be filled."
-                )
-            key = class_name.casefold()
-            if key in seen:
-                raise ValueError(f"Duplicate class in dictionary: {class_name!r}")
-            seen.add(key)
-            test_h = core.safe_formula_eval(h_formula, 10)
-            if not math.isfinite(test_h):
-                raise ValueError(f"Invalid H_formula for {class_name!r}")
-
     def _add_dictionary_row(self) -> None:
         r = self.dict_table.rowCount()
         self.dict_table.insertRow(r)
-        for c in range(3):
-            self.dict_table.setItem(r, c, QTableWidgetItem(""))
+        self.dict_table.setItem(r, 0, QTableWidgetItem(""))
+        self.dict_table.setCellWidget(r, 1, self._make_type_combo("class"))
+        self.dict_table.setItem(r, 2, QTableWidgetItem(""))
+        self.dict_table.setItem(r, 3, QTableWidgetItem(""))
         self.dict_table.setCurrentCell(r, 0)
         self.dict_table.editItem(self.dict_table.item(r, 0))
 
@@ -257,21 +250,21 @@ class RRFWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Dictionary error", str(exc))
             return
-        self._log("Dictionary saved.")
-        QMessageBox.information(self, "Dictionary", "Dictionary saved.")
+        self._log("Chemical dictionary saved.")
+        QMessageBox.information(self, "Dictionary", "Chemical dictionary saved.")
 
     def _restore_defaults(self) -> None:
         answer = QMessageBox.question(
             self,
             "Restore defaults",
-            "Replace the current dictionary with the built-in defaults?",
+            "Replace the current Chemical dictionary with the built-in defaults?",
         )
         if answer != QMessageBox.Yes:
             return
         self.dictionary_rows = [dict(row) for row in self.default_dictionary]
         self._fill_dictionary_table()
         self._save_user_dictionary()
-        self._log("Default dictionary restored.")
+        self._log("Default Chemical dictionary restored.")
 
     # -------------------- file / validation --------------------
 
@@ -295,9 +288,7 @@ class RRFWindow(QMainWindow):
         if self.input_path is None:
             raise ValueError("Choose an XLSX file first.")
 
-        rows = self._dictionary_from_table()
-        self._validate_dictionary(rows)
-        known = {core.normalize_text(r["class"]).casefold(): r for r in rows}
+        dictionary_rows = core.validate_dictionary(self._dictionary_from_table())
 
         wb = load_workbook(self.input_path, read_only=True, data_only=False)
         ws = wb.active
@@ -330,46 +321,29 @@ class RRFWindow(QMainWindow):
                 errors.append(f"row {row_idx}: invalid Volume = {volume!r}")
                 continue
 
-            text = core.normalize_text(group_name)
-            match = core.GROUP_RE.fullmatch(text)
-            if not match:
-                errors.append(f"row {row_idx}: cannot parse Group Name {text!r}")
-                continue
-
-            class_name = core.normalize_text(match.group("class"))
-            key = class_name.casefold()
-            if key not in known:
-                unknown.setdefault(class_name, []).append(row_idx)
-                continue
-
-            if not match.group("C"):
-                no_c_rows.append((row_idx, text))
-                continue
-
-            if match.group("suffix"):
-                suffix_rows.append((row_idx, text))
-
             try:
-                C = int(match.group("C"))
-                H = core.safe_formula_eval(known[key]["H_formula"], C)
-                if not math.isclose(H, round(H), abs_tol=1e-9):
-                    errors.append(f"row {row_idx}: H is not integer for {text!r}")
+                resolved = core.resolve_group_name(group_name, dictionary_rows)
+                if resolved.suffix:
+                    suffix_rows.append((row_idx, core.normalize_text(group_name)))
+            except core.MissingCarbonNumber:
+                no_c_rows.append((row_idx, core.normalize_text(group_name)))
+            except core.UnknownChemical as exc:
+                text = str(exc)
+                unknown.setdefault(text, []).append(row_idx)
             except Exception as exc:
                 errors.append(f"row {row_idx}: {exc}")
 
         wb.close()
 
-        for class_name, row_numbers in sorted(unknown.items()):
+        for message, row_numbers in sorted(unknown.items()):
             preview = ", ".join(map(str, row_numbers[:8]))
             if len(row_numbers) > 8:
                 preview += ", ..."
-            errors.append(
-                f"Unknown class {class_name!r}; rows: {preview}. Add it to the dictionary."
-            )
+            errors.append(f"{message} Rows: {preview}.")
 
         if no_c_rows:
             warnings.append(
-                f"{len(no_c_rows)} row(s) have no explicit C number and will be skipped."
+                f"{len(no_c_rows)} class row(s) have no explicit C number and will be skipped."
             )
         if suffix_rows:
             warnings.append(
@@ -420,7 +394,7 @@ class RRFWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Cannot calculate",
-                "Fix validation errors first. Unknown classes can be added in Class dictionary.",
+                "Fix validation errors first. Unknown entries can be added in Chemical dictionary.",
             )
             return
 
@@ -440,20 +414,7 @@ class RRFWindow(QMainWindow):
 
         try:
             self._save_user_dictionary()
-            classes_path = self._write_runtime_classes_txt()
-
-            # Capture console output from the existing proven calculator.
-            buffer = io.StringIO()
-            old_stdout = sys.stdout
-            try:
-                sys.stdout = buffer
-                core.calculate_file(self.input_path, classes_path, output_path)
-            finally:
-                sys.stdout = old_stdout
-
-            for line in buffer.getvalue().splitlines():
-                self._log(line)
-
+            stats = core.calculate_file(self.input_path, self.dictionary_rows, output_path)
         except PermissionError:
             QMessageBox.critical(
                 self,
@@ -466,8 +427,21 @@ class RRFWindow(QMainWindow):
             QMessageBox.critical(self, "Calculation error", str(exc))
             return
 
+        self._log(f"Done: {output_path}")
+        self._log(f"Calculated rows: {stats['calculated_rows']}")
+        self._log(f"Sum(RRF*V): {stats['sum_rrf_v']:.6f}")
+        self._log(f"Sum(w, %): {stats['sum_w']:.10f}")
+        self._log(f"Summary sheet: {stats['summary_sheet']}")
+        if stats["suffix_rows"]:
+            self._log(
+                f"WARNING: {len(stats['suffix_rows'])} row(s) contain '+' or '?'; numeric C was used."
+            )
+        if stats["skipped_no_c"]:
+            self._log(
+                f"WARNING: skipped {len(stats['skipped_no_c'])} class row(s) without explicit C number."
+            )
+
         self.status_label.setText("Status: finished")
-        self._log(f"Saved: {output_path}")
         QMessageBox.information(
             self,
             "Done",
